@@ -91,6 +91,12 @@ jobs:
                   echo "Running in $BROWSER"
                   npm run test:${{ matrix.browser }}
 
+            - name: Safari flag
+              run: |
+                  defaults write com.apple.Safari WebKitPreferences.canvasUsesAcceleratedDrawing -bool false
+                  defaults write com.apple.Safari WebKitPreferences.CanvasUsesAcceleratedDrawing -bool false
+                  defaults read com.apple.Safari | grep -i WebKitPreferences
+
             - name: Run end2end Tests
               run: |
                   echo "Running in $BROWSER"
