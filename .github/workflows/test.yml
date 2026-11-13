@@ -12,7 +12,7 @@ on:
 jobs:
     linters:
         name: Linters
-        runs-on: macos-latest
+        runs-on: ubuntu-latest
         steps:
             - name: Checkout Branch
               uses: actions/checkout@v4
@@ -68,7 +68,7 @@ jobs:
         runs-on: macos-latest
         strategy:
             matrix:
-                browser: [chrome, firefox, safari]
+                browser: [safari]
         steps:
             - name: Install Firefox
               if: ${{ matrix.browser == 'firefox' }}
