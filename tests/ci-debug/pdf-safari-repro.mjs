@@ -1,6 +1,7 @@
 // Throwaway CI diagnostic: find the smallest canvas sequence that makes Safari on the macOS CI
 // VMs wait 15s in RemoteImageBufferProxy::ensureBackend and then kill the GPU process.
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
 import { Builder } from "selenium-webdriver";
 import serve, { DEFAULT_CACHE_DURATION } from "../server.mjs";
 
@@ -9,10 +10,33 @@ const POLL_MS = 2000;
 
 const { server, port } = await serve(0, DEFAULT_CACHE_DURATION);
 const driver = await new Builder().forBrowser("safari").build();
-await driver.manage().setTimeouts({ script: 40000 });
+await driver.manage().setTimeouts({ script: 75000 });
 
 const t0 = Date.now();
+fs.mkdirSync("diag-logs", { recursive: true });
 const log = (...args) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s ${new Date().toISOString()}]`, ...args);
+
+const pendingDumps = [];
+let dumps = 0;
+function spindumpWebKit(reason) {
+    if (dumps >= 3)
+        return;
+    const n = ++dumps;
+    const pids = [...gpuPids().map((p) => ["gpu", p]), ...webContentPids().slice(0, 3).map((p) => ["webcontent", p])];
+    log(`STALL ${n} (${reason}): spindump ${JSON.stringify(pids)}`);
+    for (const [kind, pid] of pids) {
+        const child = spawn("sudo", ["-n", "spindump", pid, "3", "10", "-file", `diag-logs/spindump-${n}-${kind}-${pid}.txt`], { stdio: "ignore" });
+        pendingDumps.push(new Promise((resolve) => child.on("exit", resolve).on("error", resolve)));
+    }
+}
+
+function webContentPids() {
+    try {
+        return execFileSync("pgrep", ["-f", "com.apple.WebKit.WebContent"], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+    } catch {
+        return [];
+    }
+}
 
 function gpuPids() {
     try {
@@ -94,7 +118,7 @@ function reproTest(name, done) {
                 page.ctx.fillText(`glyphs ${i}`, (i * 13) % 760, 20 + ((i * 7) % 1030));
         });
 
-    if (name === "pattern-fresh") {
+    if (name.startsWith("pattern-fresh")) {
         const target = step("create target 200x200", () => make(200, 200));
         scratchPattern(target);
         finish();
@@ -143,17 +167,56 @@ function reproTest(name, done) {
             finish({ bitmap: [bitmap.width, bitmap.height] });
         };
         worker.postMessage(null);
+    } else if (name.startsWith("worker-")) {
+        const workerCanvas = !name.startsWith("worker-plain");
+        const mainAccelerated = !name.includes("main-unaccel");
+        const source = workerCanvas
+            ? `onmessage = () => {
+                const canvas = new OffscreenCanvas(512, 512);
+                const ctx = canvas.getContext("2d");
+                ctx.fillStyle = "#c2410c";
+                ctx.fillRect(0, 0, 512, 512);
+                postMessage("worker drew to OffscreenCanvas");
+            };`
+            : `onmessage = () => postMessage("worker without canvas");`;
+        const worker = new Worker(URL.createObjectURL(new Blob([source], { type: "text/javascript" })));
+        const timeout = setTimeout(() => finish({ workerTimeout: true }), 20000);
+        worker.onmessage = (e) => {
+            clearTimeout(timeout);
+            steps.push({ label: `worker: ${e.data}`, ms: +(performance.now() - start).toFixed(1) });
+            const make2 = (w, h, alpha = true) => {
+                const c = document.createElement("canvas");
+                c.width = w;
+                c.height = h;
+                return { c, ctx: c.getContext("2d", { alpha, willReadFrequently: !mainAccelerated }) };
+            };
+            const page = step(`create page canvas 820x1061 (${mainAccelerated ? "accelerated" : "unaccelerated"})`, () => make2(820, 1061, false));
+            step("attach page canvas", () => document.body.append(page.c));
+            const tmp = step("create scratch canvas 512x512", () => make2(512, 512));
+            step("gradient fill scratch", () => gradientFill(tmp));
+            step("createPattern(scratch)", () => page.ctx.createPattern(tmp.c, "no-repeat"));
+            requestAnimationFrame(() =>
+                requestAnimationFrame(() => {
+                    steps.push({ label: "two frames rendered", ms: +(performance.now() - start).toFixed(1) });
+                    worker.terminate();
+                    finish({ workerCanvas, mainAccelerated });
+                })
+            );
+        };
+        worker.postMessage(null);
     } else {
         finish({ error: "unknown test" });
     }
 }
 
 async function runReproTests() {
-    for (const name of ["pattern-fresh", "pattern-after-10k-text", "pattern-after-10k-text-timeout", "pattern-worker-bitmap"]) {
+    for (const name of ["pattern-fresh", "worker-plain", "worker-offscreen-main-unaccel", "worker-offscreen", "worker-offscreen-again", "pattern-fresh-after"]) {
         await driver.get(`http://localhost:${port}/index.html`);
         const before = gpuPids();
         log(`REPRO ${name} start, GPU pids ${JSON.stringify(before)}`);
+        const watchdog = setTimeout(() => spindumpWebKit(`${name} still running after 5s`), 5000);
         const result = await safeAsyncScript(`repro ${name}`, reproTest, name);
+        clearTimeout(watchdog);
         const after = gpuPids();
         const slow = result?.steps?.filter((s) => s.ms > 1000) ?? [];
         log(`REPRO ${name} ${slow.length ? "SLOW" : "ok"}, GPU pids ${JSON.stringify(after)}${before.join() === after.join() ? "" : " (GPU process replaced)"}`, JSON.stringify(result));
@@ -308,7 +371,8 @@ async function runPdfViewer() {
 
 try {
     await runReproTests();
-    await runPdfViewer();
+    log(`waiting for ${pendingDumps.length} spindump(s)`);
+    await Promise.race([Promise.all(pendingDumps), new Promise((resolve) => setTimeout(resolve, 180000))]);
 } finally {
     await driver.quit().catch(() => {});
     server.close();
