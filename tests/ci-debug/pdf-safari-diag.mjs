@@ -1,4 +1,6 @@
 // Throwaway CI diagnostic: why does PDFViewer-PDFjs with enableHWA never finish in CI Safari?
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
 import { Builder } from "selenium-webdriver";
 import serve, { DEFAULT_CACHE_DURATION } from "../server.mjs";
 
@@ -12,9 +14,61 @@ await driver.manage().setTimeouts({ script: 30000 });
 const t0 = Date.now();
 const log = (...args) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s ${new Date().toISOString()}]`, ...args);
 
+// When a WebDriver call stalls, the page is usually blocked on the GPU process, so take
+// kernel stack snapshots of the WebKit processes while the stall is still happening.
+const LOG_DIR = "diag-logs";
+const WATCHDOG_MS = Number(process.env.WATCHDOG_MS ?? 4000);
+const MAX_STALLS = 3;
+fs.mkdirSync(LOG_DIR, { recursive: true });
+const pendingDumps = [];
+let stallCount = 0;
+
+function pidsMatching(pattern) {
+    try {
+        return execFileSync("pgrep", ["-f", pattern], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+    } catch {
+        return [];
+    }
+}
+
+function captureStacks(reason) {
+    if (stallCount >= MAX_STALLS)
+        return;
+    const stall = ++stallCount;
+    const targets = [...pidsMatching("com.apple.WebKit.GPU").map((pid) => ["gpu", pid]), ...pidsMatching("com.apple.WebKit.WebContent").slice(0, 4).map((pid) => ["webcontent", pid])];
+    log(`STALL ${stall} (${reason}): spindump ${JSON.stringify(targets)}`);
+    for (const [kind, pid] of targets) {
+        const file = `${LOG_DIR}/spindump-stall${stall}-${kind}-${pid}.txt`;
+        const child = spawn("sudo", ["-n", "spindump", pid, "3", "10", "-file", file], { stdio: ["ignore", "ignore", "pipe"] });
+        let stderr = "";
+        child.stderr.on("data", (chunk) => (stderr += chunk));
+        pendingDumps.push(
+            new Promise((resolve) => {
+                child.on("exit", (code) => {
+                    log(`spindump ${file} exit=${code}${stderr ? ` stderr=${stderr.trim().slice(0, 200)}` : ""}`);
+                    resolve();
+                });
+                child.on("error", (e) => {
+                    log(`spindump ${file} error=${e.message}`);
+                    resolve();
+                });
+            })
+        );
+    }
+}
+
+async function watched(label, promise) {
+    const timer = setTimeout(() => captureStacks(`${label} still running after ${WATCHDOG_MS}ms`), WATCHDOG_MS);
+    try {
+        return await promise;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function safeScript(label, fn, ...args) {
     try {
-        return await driver.executeScript(fn, ...args);
+        return await watched(label, driver.executeScript(fn, ...args));
     } catch (e) {
         log(`${label}: executeScript failed (${e.name}: ${e.message})`);
         return null;
@@ -23,7 +77,7 @@ async function safeScript(label, fn, ...args) {
 
 async function safeAsyncScript(label, fn, ...args) {
     try {
-        return await driver.executeAsyncScript(fn, ...args);
+        return await watched(label, driver.executeAsyncScript(fn, ...args));
     } catch (e) {
         log(`${label}: executeAsyncScript failed (${e.name}: ${e.message})`);
         return null;
@@ -242,11 +296,88 @@ async function primitives() {
         log("PRIMITIVE", JSON.stringify(row));
 }
 
+// The candidates for what wedges the GPU process: page-sized accelerated canvases that get
+// composited (pdf.js page canvases are alpha: false), and a 2D OffscreenCanvas in a worker.
+async function displayPrimitives() {
+    for (const test of ["opaque-820x1061", "alpha-820x1061", "worker-offscreen-820x1061"]) {
+        const result = await safeAsyncScript(
+            `display ${test}`,
+            (test, done) => {
+                const start = performance.now();
+                const elapsed = () => +(performance.now() - start).toFixed(1);
+                const afterFrames = (canvas, ctx) =>
+                    requestAnimationFrame(() =>
+                        requestAnimationFrame(() => {
+                            let pattern;
+                            try {
+                                ctx.createPattern(canvas, "repeat");
+                                pattern = "ok";
+                            } catch (e) {
+                                pattern = `${e.name}: ${e.message}`;
+                            }
+                            canvas.remove();
+                            done({ ms: elapsed(), pattern });
+                        })
+                    );
+                if (test.startsWith("worker")) {
+                    const source = `onmessage = () => {
+                        const t = performance.now();
+                        const canvas = new OffscreenCanvas(820, 1061);
+                        const ctx = canvas.getContext("2d");
+                        ctx.fillStyle = "#336699";
+                        ctx.fillRect(0, 0, 820, 1061);
+                        ctx.font = "16px sans-serif";
+                        for (let i = 0; i < 500; i++)
+                            ctx.fillText("glyphs " + i, (i * 13) % 760, (i * 7) % 1040);
+                        const bitmap = canvas.transferToImageBitmap();
+                        postMessage({ workerMs: performance.now() - t, width: bitmap.width }, [bitmap]);
+                    };`;
+                    const worker = new Worker(URL.createObjectURL(new Blob([source], { type: "text/javascript" })));
+                    const timeout = setTimeout(() => done({ ms: elapsed(), timeout: true }), 25000);
+                    worker.onerror = (e) => {
+                        clearTimeout(timeout);
+                        done({ ms: elapsed(), error: String(e.message) });
+                    };
+                    worker.onmessage = (e) => {
+                        clearTimeout(timeout);
+                        worker.terminate();
+                        done({ ms: elapsed(), ...e.data });
+                    };
+                    worker.postMessage(null);
+                    return;
+                }
+                const canvas = document.createElement("canvas");
+                canvas.width = 820;
+                canvas.height = 1061;
+                const ctx = canvas.getContext("2d", { alpha: !test.startsWith("opaque"), willReadFrequently: false });
+                const gradient = ctx.createLinearGradient(0, 0, 0, 1061);
+                gradient.addColorStop(0, "#d9d9d9");
+                gradient.addColorStop(1, "#141414");
+                ctx.fillStyle = gradient;
+                ctx.fillRect(0, 0, 820, 1061);
+                ctx.fillStyle = "#fff";
+                ctx.font = "16px sans-serif";
+                for (let i = 0; i < 500; i++)
+                    ctx.fillText(`glyphs ${i}`, (i * 13) % 760, (i * 7) % 1040);
+                document.body.append(canvas);
+                afterFrames(canvas, ctx);
+            },
+            test
+        );
+        log("DISPLAY", test, JSON.stringify(result));
+    }
+}
+
 try {
+    log("WebKit processes at start", JSON.stringify({ gpu: pidsMatching("com.apple.WebKit.GPU"), webcontent: pidsMatching("com.apple.WebKit.WebContent") }));
     await driver.get(`http://localhost:${port}/index.html`);
     await envInfo();
     await primitives();
+    await displayPrimitives();
     await runPdfViewer();
+    log("WebKit processes at end", JSON.stringify({ gpu: pidsMatching("com.apple.WebKit.GPU"), webcontent: pidsMatching("com.apple.WebKit.WebContent") }));
+    log(`waiting for ${pendingDumps.length} spindump(s)`);
+    await Promise.race([Promise.all(pendingDumps), new Promise((resolve) => setTimeout(resolve, 180000))]);
 } finally {
     await driver.quit().catch(() => {});
     server.close();
