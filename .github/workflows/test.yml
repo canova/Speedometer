@@ -36,7 +36,7 @@ jobs:
                   echo "LOG_START=$(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
 
             - name: Run diagnostic
-              run: node tests/ci-debug/pdf-safari-diag.mjs 2>&1 | grep -v "GET /"
+              run: node tests/ci-debug/pdf-safari-repro.mjs 2>&1 | grep -v "GET /"
 
             - name: Collect logs
               if: always()
