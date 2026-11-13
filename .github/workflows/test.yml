@@ -7,7 +7,7 @@ jobs:
     pdf-safari-diag:
         name: PDFViewer Safari diagnostic
         runs-on: macos-latest
-        timeout-minutes: 15
+        timeout-minutes: 20
         steps:
             - name: Checkout Branch
               uses: actions/checkout@v4
@@ -22,7 +22,44 @@ jobs:
               run: npm ci
 
             - name: Hardware
-              run: system_profiler SPDisplaysDataType SPHardwareDataType || true
+              run: |
+                  system_profiler SPDisplaysDataType SPHardwareDataType || true
+                  sw_vers
+                  defaults read /Applications/Safari.app/Contents/Info CFBundleShortVersionString || true
+
+            - name: Enable WebKit logging
+              run: |
+                  sudo log config --subsystem com.apple.WebKit --mode "level:debug,persist:debug"
+                  sudo log config --subsystem com.apple.WebCore --mode "level:debug,persist:debug"
+                  defaults write com.apple.Safari WebKit2Logging "RemoteLayerBuffers,IPC,Process,Images,WebGL,DisplayLists"
+                  defaults write com.apple.Safari WebCoreLogging "IOSurface,GraphicsBuffer,Images,GLContext,Compositing"
+                  echo "LOG_START=$(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
 
             - name: Run diagnostic
               run: node tests/ci-debug/pdf-safari-diag.mjs 2>&1 | grep -v "GET /"
+
+            - name: Collect logs
+              if: always()
+              run: |
+                  mkdir -p diag-logs
+                  sleep 2
+                  log show --start "$LOG_START" --info --debug --style compact \
+                      --predicate 'process BEGINSWITH "com.apple.WebKit" OR subsystem BEGINSWITH "com.apple.WebKit" OR subsystem BEGINSWITH "com.apple.WebCore" OR process == "Safari" OR process == "safaridriver"' \
+                      > diag-logs/webkit.log || true
+                  log show --start "$LOG_START" --style compact \
+                      --predicate 'process BEGINSWITH "com.apple.WebKit.GPU" OR (process BEGINSWITH "com.apple.WebKit" AND (eventMessage CONTAINS[c] "iosurface" OR eventMessage CONTAINS[c] "metal" OR eventMessage CONTAINS[c] "fail" OR eventMessage CONTAINS[c] "error" OR eventMessage CONTAINS[c] "unresponsive" OR eventMessage CONTAINS[c] "timeout"))' \
+                      > diag-logs/webkit-errors.log || true
+                  wc -l diag-logs/*.log
+                  cp ~/Library/Logs/DiagnosticReports/*WebKit* diag-logs/ 2>/dev/null || true
+                  sudo cp /Library/Logs/DiagnosticReports/*WebKit* diag-logs/ 2>/dev/null || true
+                  sudo chown -R "$(whoami)" diag-logs
+                  ls -la diag-logs
+                  echo "===== GPU process + WebKit errors (first 400 lines) ====="
+                  head -400 diag-logs/webkit-errors.log
+
+            - name: Upload logs
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: webkit-logs
+                  path: diag-logs

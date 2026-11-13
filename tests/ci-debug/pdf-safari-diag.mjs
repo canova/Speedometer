@@ -2,7 +2,7 @@
 import { Builder } from "selenium-webdriver";
 import serve, { DEFAULT_CACHE_DURATION } from "../server.mjs";
 
-const RUN_TIMEOUT_MS = 240000;
+const RUN_TIMEOUT_MS = 90000;
 const POLL_MS = 2000;
 
 const { server, port } = await serve(0, DEFAULT_CACHE_DURATION);
@@ -10,7 +10,7 @@ const driver = await new Builder().forBrowser("safari").build();
 await driver.manage().setTimeouts({ script: 30000 });
 
 const t0 = Date.now();
-const log = (...args) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s]`, ...args);
+const log = (...args) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s ${new Date().toISOString()}]`, ...args);
 
 async function safeScript(label, fn, ...args) {
     try {
